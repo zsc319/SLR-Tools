@@ -12,7 +12,9 @@ from bs4 import BeautifulSoup
 from selenium import webdriver
 from selenium.common.exceptions import ElementNotInteractableException
 from selenium.common.exceptions import StaleElementReferenceException
+from selenium.common.exceptions import ElementClickInterceptedException
 from selenium.webdriver.support.ui import Select
+from selenium.webdriver.support.ui import WebDriverWait
 from selenium.common.exceptions import NoSuchElementException
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.common.desired_capabilities import DesiredCapabilities
@@ -44,21 +46,43 @@ def start_session(driver, query, n, patents, citations, start_year, end_year):
 
     # parse all entries for each year
     while year >= end_year:
-        time.sleep(random.randrange(5, 15))
+        # time.sleep(random.randrange(5, 15))
         logging.info("crawling year {year}".format(year=year))
-        # start=x where is x is the item number of results to display,
-        # can be 0 to start from beginning
-        # q is the search query (%22 are the URL-encoded exact match quotes)
         url = "https://scholar.google.com/scholar?start={n}&q={query}&hl=en&{patents}&{citations}&as_ylo={year}&as_yhi={year}".format(
             n=n, query=urllib.parse.quote(query), patents=patents, citations=citations, year=year)
+
+        # navigate to GS
         logging.debug("getting url")
-        driver.get(url)
+        driver.get("https://scholar.google.com")
+        time.sleep(random.randrange(2,3))
+
+        soup = check_for_captcha()
+        for i in range(5):
+            driver.find_element_by_tag_name("html").send_keys(Keys.CONTROL,Keys.SUBTRACT)
+            time.sleep(0.2)
+        # enter query
+        search_input = driver.find_element_by_xpath('//*[@id="gs_hdr_tsi"]')
+        search_input.send_keys(query)
+        time.sleep(random.randrange(2,3))
+        search_input.send_keys(Keys.RETURN)
+        time.sleep(random.randrange(2,3))
+        soup = check_for_captcha()
+
+        # in-/exclude patents or citations
+        patents_button = driver.find_element_by_xpath('/html/body/div/div[11]/div[1]/div/ul[2]/li[1]')
+        citations_button = driver.find_element_by_xpath('/html/body/div/div[11]/div[1]/div/ul[2]/li[2]')
+        logging.info(patents_button)
+        if not patents:
+            patents_button.click()
+        if not citations:
+            citations_button.click()
+        time.sleep(random.randrange(2,3))
         soup = check_for_captcha()
 
         result_count = int(driver.find_element_by_xpath(
-            '//*[@id="gs_ab_md"]/div').text.replace(".", "").replace("About ", "").split(" ")[0])
+            '/html/body/div/div[10]/div[3]/div').text.replace(".", "").replace("About ", "").split(" ")[0])
         if result_count > 999:
-            logging.warning("With {count} results you are missing results (Google Scholar has a limit of 1000 results per query). Try changing your query".format(
+            logging.warning("With {count} results, you are missing results (Google Scholar has a limit of 1000 results per query). Try changing your query to something more specific.".format(
                 count=result_count))
         else:
             logging.info("Got {count} results for query and year.".format(
@@ -68,27 +92,66 @@ def start_session(driver, query, n, patents, citations, start_year, end_year):
 
         finished = False
         while not finished:
+            # parse data as bibfiles
+            time.sleep(random.randrange(3, 6))
             datalist = []  # empty list
-            soup = check_for_captcha()
+            biblist = []
 
+            # parse data from bib-objects
+            logging.info(len(list(driver.find_elements_by_class_name("gs_or_cit"))))
+            for i in range(10):
+                c = 0
+                try:
+                    entry = list(driver.find_elements_by_class_name("gs_or_cit"))[i]
+                    entry.click()
+                except ElementClickInterceptedException:
+                    c+=1
+                    entry = list(driver.find_elements_by_class_name("gs_or_cit"))[i]
+                    entry.click()
+                    if c == 10:
+                        raise
+
+                time.sleep(random.randrange(2, 3))
+                soup = check_for_captcha()
+                driver.find_element_by_xpath("/html/body/div/div[4]/div/div[2]/div/div[2]/a[1]").click()
+                time.sleep(random.randrange(2, 3))
+                soup = check_for_captcha()
+                bib_elem = BeautifulSoup(driver.page_source, 'lxml').get_text()
+                driver.back()
+                time.sleep(random.randrange(2, 3))
+                driver.find_element_by_id("gs_cit-x").click()
+                time.sleep(random.randrange(2, 3))
+                soup = check_for_captcha()
+                biblist.append(bib_elem)
+                time.sleep(random.randrange(0, 1))
+
+
+            # parse data from GS result pages
+            soup = check_for_captcha()
             entries = soup.find_all(class_="gs_r gs_or gs_scl")
             for entry in entries:
+                cite_count = int(list(entry.find(class_="gs_or_cit").next_siblings)[1].get_text().replace('Cited by ',''))
                 n += 1
                 # create a dictionary of each result element
                 datalist.append({"id": "{0}-{1}".format(year, n),
                                  "title": re.sub(r'\[.*\]', '', entry.find(class_="gs_rt").get_text()),
                                  "author": entry.find(class_="gs_a").get_text(),
-                                 "year": year
+                                 "year": year,
+                                 "abstract": entry.find(class_="gs_rs").get_text(),
+                                 "citation_count": cite_count
                                  })
-            # update json file every page
-            try:
-                with open('data_incomplete.json', 'r') as inp:
-                    data = json.load(inp)
+                with open('data_incomplete.bibtex', 'a') as inp:
+                    inp.write("\n".join(biblist))
+
+        # update json file every year
+        try:
+            with open('data_incomplete.json', 'r') as inp:
+                data = json.load(inp)
                 data.extend(datalist)
-            except FileNotFoundError:
-                data = datalist
-            with open('data_incomplete.json', 'w') as outfile:
-                json.dump(data, outfile, ensure_ascii=False)
+        except FileNotFoundError:
+            data = datalist
+        with open('data_incomplete.json', 'w') as outfile:
+            json.dump(data, outfile, ensure_ascii=False)
 
             logging.debug("loading next page")
             try:
@@ -100,25 +163,36 @@ def start_session(driver, query, n, patents, citations, start_year, end_year):
                 n = 0
                 year -= 1
                 finished = True
+    logging.debug("Finished crawling for given query and year(s). Renaming data file.")
     os.rename("data_incomplete.json","data_complete.json")
     driver.quit()
 
 
 if __name__ == '__main__':
-    query = input('Enter query exactly as you would on the website: ')
-    # if you want to continue a crawl, set n to the last crawled id (in steps
-    # of 10)
-    n = 0
-    patents = input('Do you want to include patents? y/n? ') =='y'
-    citations = input('Do you want to include citations? y/n? ') =='y'
-    # set start_year to the year from which you want to start searching
-    # (backwards), this won't yield all results with more than 1000 results
-    # for any year
-    start_year = int(input("Enter start year (newest year): "))
-    end_year = int(input("Enter end year (oldest year): "))
+    debug = True
+    if debug:
+        query = 'interface AND user AND search AND system AND "Information Retrieval" AND "Virtual Reality"'
+        patents = False
+        citations = True
+        n=0
+        start_year = 2019
+        end_year = 2019
+    else:
+        query = input('Enter query exactly as you would on the website: ')
+        # if you want to continue a crawl, set n to the last crawled id (in steps
+        # of 10)
+        n = 0
+        patents = input('Do you want to include patents? y/n? ') =='y'
+        citations = input('Do you want to include citations? y/n? ') =='y'
+        # set start_year to the year from which you want to start searching
+        # (backwards), this won't yield all results with more than 1000 results
+        # for any year
+        start_year = int(input("Enter start year (newest year): "))
+        end_year = int(input("Enter end year (oldest year): "))
 
     # init webdriver late so we don't move focus from terminal
     driver = webdriver.Firefox()
+    driver.implicitly_wait(10) # seconds
 
     start_session(driver, query=query,
                   n=0, patents=patents, citations=citations, start_year=start_year, end_year=end_year)
